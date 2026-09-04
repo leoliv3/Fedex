@@ -64,11 +64,11 @@ class FedExClient:
 
 
 class FedExParser:
-    # Termos e códigos frequentes na FedEx que indicam retenção / trâmite alfandegário
-    CLEARANCE_CODES = ["CD", "DE"]  # Clearance Delay / Delivery Exception
+    CLEARANCE_CODES = ["CD", "DE"]
     CLEARANCE_KEYWORDS = [
         "clearance", "customs", "alfandega", "alfândega", "aduaneira", 
-        "liberação", "fiscalização", "retido", "formal", "receita federal", "import"
+        "liberação", "liberacao", "fiscalização", "retido", "formal", 
+        "receita federal", "import", "release", "customs clearance"
     ]
 
     @classmethod
@@ -86,10 +86,12 @@ class FedExParser:
                 "Detalhe": "AWB inexistente ou sem eventos"
             }
 
-        first_track = track_results[0]
-
-        if "error" in first_track:
-            err_msg = first_track["error"].get("message", "Código Inválido")
+        # 1. Resolver reciclagem de AWB: escolher a remessa mais recente pelo ano/data
+        # Ignora envios arquivados de anos anteriores se houver múltiplos
+        valid_tracks = [t for t in track_results if "error" not in t]
+        
+        if not valid_tracks:
+            err_msg = track_results[0].get("error", {}).get("message", "Código Inválido")
             return {
                 "AWB": awb,
                 "Status": "ERRO",
@@ -99,7 +101,19 @@ class FedExParser:
                 "Detalhe": err_msg
             }
 
-        status_detail = first_track.get("latestStatusDetail", {})
+        # Função auxiliar para extrair a data mais recente de cada trackResult
+        def get_track_latest_date(track_obj):
+            dates = track_obj.get("dateAndTimes", [])
+            date_strs = [d.get("dateTime", "") for d in dates if d.get("dateTime")]
+            scans = track_obj.get("scanEvents", [])
+            date_strs.extend([s.get("date", "") for s in scans if s.get("date")])
+            return max(date_strs) if date_strs else ""
+
+        # Ordena para garantir que pegamos a remessa mais nova (2026 em vez de 2023)
+        track_selected = max(valid_tracks, key=get_track_latest_date)
+
+        # 2. Status Principal
+        status_detail = track_selected.get("latestStatusDetail", {})
         code = status_detail.get("code", "")
         desc = status_detail.get("description", "Em Trânsito")
         status_resumido = "EM TRÂNSITO"
@@ -109,13 +123,22 @@ class FedExParser:
         elif code in ["DE", "CD"]:
             status_resumido = "RETIDO / EXCEÇÃO"
 
-        # 1. Localização Atual (último escaneamento)
-        scan_events = first_track.get("scanEvents", [])
+        # 3. Local Atual e Último Evento (ordenando scanEvents por data decrescente)
+        scan_events = track_selected.get("scanEvents", [])
         local_atual = "Não identificado"
-        
+        last_event_desc = ""
+
         if scan_events:
-            last_scan = scan_events[0]
-            scan_loc = last_scan.get("scanLocation", {})
+            # Ordena os eventos pelo campo 'date' para pegar o mais recente do topo
+            scan_events_sorted = sorted(
+                scan_events, 
+                key=lambda x: x.get("date", ""), 
+                reverse=True
+            )
+            latest_scan = scan_events_sorted[0]
+            last_event_desc = latest_scan.get("eventDescription", "")
+            
+            scan_loc = latest_scan.get("scanLocation", {})
             city = scan_loc.get("city", "")
             state = scan_loc.get("stateOrProvinceCode", "")
             country = scan_loc.get("countryCode", "")
@@ -123,20 +146,19 @@ class FedExParser:
             if parts:
                 local_atual = ", ".join(parts)
 
-        # 2. Verificação de Retenção / Liberação Aduaneira
+        # 4. Verificação de Aduana / Liberação Formal
         aduana_alerta = "NÃO"
-        
-        # Checa status principal e scan events recentes
-        text_to_check = (desc + " " + code).lower()
-        if scan_events:
-            event_desc = scan_events[0].get("eventDescription", "").lower()
-            text_to_check += f" {event_desc}"
+        text_to_check = f"{desc} {code} {last_event_desc}".lower()
 
         if code in cls.CLEARANCE_CODES or any(kw in text_to_check for kw in cls.CLEARANCE_KEYWORDS):
-            aduana_alerta = "⚠️ AGUARDANDO LIBERAÇÃO / ADUANA"
+            # Se já foi liberado (ex: "International shipment release")
+            if "release" in text_to_check or "liberado" in text_to_check:
+                aduana_alerta = "✅ LIBERADO NA ALFÂNDEGA"
+            else:
+                aduana_alerta = "⚠️ AGUARDANDO LIBERAÇÃO / ADUANA"
 
-        # 3. Data Estimada ou Real
-        dates = first_track.get("dateAndTimes", [])
+        # 5. Data Estimada ou Real
+        dates = track_selected.get("dateAndTimes", [])
         data_entrega = "N/A"
         actual_del = next((d.get("dateTime") for d in dates if d.get("type") == "ACTUAL_DELIVERY"), None)
         est_del = next((d.get("dateTime") for d in dates if d.get("type") in ["ESTIMATED_DELIVERY", "COMMITMENT"]), None)
@@ -146,15 +168,19 @@ class FedExParser:
         elif est_del:
             data_entrega = f"Prevista: {est_del[:10]}"
 
+        # Se houver descrição do último scan, enriquecer o detalhe
+        detalhe_final = desc
+        if last_event_desc and last_event_desc.lower() not in desc.lower():
+            detalhe_final = f"{desc} ({last_event_desc})"
+
         return {
             "AWB": awb,
             "Status": status_resumido,
             "Aduana_Alerta": aduana_alerta,
             "Local_Atual": local_atual,
             "Data_Entrega": data_entrega,
-            "Detalhe": desc
+            "Detalhe": detalhe_final
         }
-
 
 def chunk_list(data: List[Any], chunk_size: int = 30):
     for i in range(0, len(data), chunk_size):
