@@ -2,19 +2,16 @@ name: FedEx Tracking Auto Sync
 
 on:
   schedule:
-    # Horários de Brasília (UTC-3):
-    # 07:00 BRT (10:00 UTC) e 12:00 BRT (15:00 UTC)
     - cron: '0 10,15 * * 1-5'
-    # 15:30 BRT (18:30 UTC)
     - cron: '30 18 * * 1-5'
-  workflow_dispatch: # Botão para rodar manualmente
+  workflow_dispatch:
 
 jobs:
   track-courier:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout do Repositório
+      - name: Checkout do Repositorio
         uses: actions/checkout@v4
 
       - name: Configurar Python
