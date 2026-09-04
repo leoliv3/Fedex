@@ -43,8 +43,11 @@ class FedExClient:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Falha na autenticação com a FedEx: {e}")
 
-    def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
-        """Consulta até 30 AWBs por requisição com histórico detalhado."""
+    
+def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
+        """Consulta até 30 AWBs por requisição, filtrando remessas dos últimos 180 dias."""
+        from datetime import datetime, timedelta
+
         token = self.get_token()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -52,8 +55,16 @@ class FedExClient:
             "X-locale": "pt_BR"
         }
 
+        # Força a FedEx a ignorar históricos arquivados de anos anteriores (ex: 2023)
+        data_limite = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
         tracking_info_list = [
-            {"trackingNumberInfo": {"trackingNumber": str(awb).strip()}}
+            {
+                "trackingNumberInfo": {
+                    "trackingNumber": str(awb).strip(),
+                    "shipDateBegin": data_limite
+                }
+            }
             for awb in tracking_numbers
         ]
 
@@ -70,7 +81,6 @@ class FedExClient:
         except requests.exceptions.RequestException as e:
             print(f"Erro ao consultar lote FedEx: {e}")
             return []
-
 
 class FedExParser:
     """Extrai e normaliza informações de tracking tratando reciclagem de AWB e aduana."""
