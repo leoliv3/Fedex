@@ -8,7 +8,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 
 class FedExClient:
-    """Gerencia autenticação OAuth 2.0 e consultas em lote à API da FedEx."""
+    """Gerencia autenticação OAuth 2.0 e requisições em lote à API REST da FedEx."""
 
     def __init__(self, client_id: str, client_secret: str, sandbox: bool = False):
         self.client_id = client_id.strip() if client_id else ""
@@ -20,7 +20,7 @@ class FedExClient:
         self.token_expiry: float = 0
 
     def get_token(self) -> str:
-        """Obtém ou renova o bearer token antes de expirar."""
+        """Gera ou renova o Bearer Token antes da expiração."""
         if self.token and time.time() < (self.token_expiry - 60):
             return self.token
 
@@ -34,7 +34,7 @@ class FedExClient:
         try:
             response = requests.post(self.auth_url, data=payload, headers=headers, timeout=20)
             if response.status_code != 200:
-                print(f"[ERRO FEDEX AUTH] Status: {response.status_code} | Resposta: {response.text}")
+                print(f"[ERRO FEDEX AUTH] Status: {response.status_code} | Detalhe: {response.text}")
             response.raise_for_status()
             data = response.json()
             self.token = data["access_token"]
@@ -43,11 +43,8 @@ class FedExClient:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Falha na autenticação com a FedEx: {e}")
 
-    
-def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
-        """Consulta até 30 AWBs por requisição, filtrando remessas dos últimos 180 dias."""
-        from datetime import datetime, timedelta
-
+    def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
+        """Consulta até 30 AWBs por chamada com histórico detalhado de escaneamentos."""
         token = self.get_token()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -55,16 +52,9 @@ def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
             "X-locale": "pt_BR"
         }
 
-        # Força a FedEx a ignorar históricos arquivados de anos anteriores (ex: 2023)
-        data_limite = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
-
+        # Formato limpo e universal aceito pela API da FedEx
         tracking_info_list = [
-            {
-                "trackingNumberInfo": {
-                    "trackingNumber": str(awb).strip(),
-                    "shipDateBegin": data_limite
-                }
-            }
+            {"trackingNumberInfo": {"trackingNumber": str(awb).strip()}}
             for awb in tracking_numbers
         ]
 
@@ -75,20 +65,23 @@ def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
 
         try:
             response = requests.post(self.track_url, json=payload, headers=headers, timeout=30)
+            if response.status_code != 200:
+                print(f"[ERRO FEDEX TRACK] Status: {response.status_code} | Resposta: {response.text}")
             response.raise_for_status()
             res_json = response.json()
             return res_json.get("output", {}).get("completeTrackResults", [])
         except requests.exceptions.RequestException as e:
-            print(f"Erro ao consultar lote FedEx: {e}")
+            print(f"Erro ao consultar lote na FedEx: {e}")
             return []
 
+
 class FedExParser:
-    """Extrai e normaliza informações de tracking tratando reciclagem de AWB e aduana."""
+    """Interpreta os retornos, tratando reciclagem de AWB e retenções aduaneiras."""
 
     CLEARANCE_CODES = ["CD", "DE"]
     CLEARANCE_KEYWORDS = [
-        "clearance", "customs", "alfandega", "alfândega", "aduaneira", 
-        "liberação", "liberacao", "fiscalização", "fiscalizacao", "retido", 
+        "clearance", "customs", "alfandega", "alfândega", "aduaneira",
+        "liberação", "liberacao", "fiscalização", "fiscalizacao", "retido",
         "formal", "receita federal", "import", "release"
     ]
 
@@ -109,7 +102,6 @@ class FedExParser:
 
         valid_tracks = [t for t in track_results if "error" not in t]
 
-        # Se todas as instâncias retornaram erro na FedEx
         if not valid_tracks:
             err_msg = track_results[0].get("error", {}).get("message", "Código Inválido")
             return {
@@ -121,14 +113,20 @@ class FedExParser:
                 "Detalhe": err_msg
             }
 
-        # 1. Tratar reciclagem de AWBs: selecionar a remessa com a data mais recente
+        # 1. Tratar reciclagem de AWB: extrair a data mais recente de cada trackResult
         def get_track_latest_date(track_obj):
-            dates = track_obj.get("dateAndTimes", [])
-            date_strs = [d.get("dateTime", "") for d in dates if d.get("dateTime")]
-            scans = track_obj.get("scanEvents", [])
-            date_strs.extend([s.get("date", "") for s in scans if s.get("date")])
-            return max(date_strs) if date_strs else ""
+            date_candidates = []
+            for d in track_obj.get("dateAndTimes", []):
+                val = d.get("dateTime")
+                if val:
+                    date_candidates.append(str(val))
+            for s in track_obj.get("scanEvents", []):
+                val = s.get("date")
+                if val:
+                    date_candidates.append(str(val))
+            return max(date_candidates) if date_candidates else ""
 
+        # Seleciona o pacote com o evento mais novo (2026 ao invés de 2023)
         track_selected = max(valid_tracks, key=get_track_latest_date)
 
         # 2. Status Geral
@@ -142,15 +140,15 @@ class FedExParser:
         elif code in ["DE", "CD"]:
             status_resumido = "RETIDO / EXCEÇÃO"
 
-        # 3. Local Atual e Último Evento (ordenando scanEvents do mais novo para o mais antigo)
+        # 3. Local Atual e Último Evento (ordena scanEvents cronologicamente de forma decrescente)
         scan_events = track_selected.get("scanEvents", [])
         local_atual = "Não identificado"
         last_event_desc = ""
 
         if scan_events:
             scan_events_sorted = sorted(
-                scan_events, 
-                key=lambda x: x.get("date", ""), 
+                scan_events,
+                key=lambda x: str(x.get("date", "")),
                 reverse=True
             )
             latest_scan = scan_events_sorted[0]
@@ -164,7 +162,7 @@ class FedExParser:
             if parts:
                 local_atual = ", ".join(parts)
 
-        # 4. Verificação Alfandegária / Liberação
+        # 4. Verificação Alfandegária / Liberação Formal
         aduana_alerta = "NÃO"
         text_to_check = f"{desc} {code} {last_event_desc}".lower()
 
@@ -174,18 +172,18 @@ class FedExParser:
             else:
                 aduana_alerta = "⚠️ AGUARDANDO LIBERAÇÃO / ADUANA"
 
-        # 5. Data Estimada ou Real de Entrega
+        # 5. Data de Entrega (Real ou Previsão)
         dates = track_selected.get("dateAndTimes", [])
         data_entrega = "N/A"
         actual_del = next((d.get("dateTime") for d in dates if d.get("type") == "ACTUAL_DELIVERY"), None)
         est_del = next((d.get("dateTime") for d in dates if d.get("type") in ["ESTIMATED_DELIVERY", "COMMITMENT"]), None)
 
         if actual_del:
-            data_entrega = f"Entregue em {actual_del[:10]}"
+            data_entrega = f"Entregue em {str(actual_del)[:10]}"
         elif est_del:
-            data_entrega = f"Prevista: {est_del[:10]}"
+            data_entrega = f"Prevista: {str(est_del)[:10]}"
 
-        # Complementa a descrição com o evento específico se for relevante
+        # Detalhe descritivo final
         detalhe_final = desc
         if last_event_desc and last_event_desc.lower() not in desc.lower():
             detalhe_final = f"{desc} ({last_event_desc})"
@@ -201,13 +199,12 @@ class FedExParser:
 
 
 def chunk_list(data: List[Any], chunk_size: int = 30):
-    """Divide listas em lotes de até 30 itens para o endpoint da FedEx."""
     for i in range(0, len(data), chunk_size):
         yield data[i:i + chunk_size]
 
 
 def sync_google_sheets():
-    """Função principal: lê a planilha, consulta a FedEx e atualiza as células."""
+    """Lê as AWBs pendentes no Google Sheets, consulta a FedEx e atualiza a planilha."""
     gcp_key = os.getenv("GCP_SA_KEY")
     sheet_id = os.getenv("GSHEET_ID")
     client_id = os.getenv("FEDEX_CLIENT_ID")
@@ -215,9 +212,9 @@ def sync_google_sheets():
     is_sandbox = os.getenv("FEDEX_ENV", "production").lower() == "sandbox"
 
     if not gcp_key or not sheet_id:
-        raise ValueError("Variáveis GCP_SA_KEY ou GSHEET_ID não configuradas.")
+        raise ValueError("Secrets GCP_SA_KEY ou GSHEET_ID não configurados.")
 
-    # Conectar ao Google Sheets via Conta de Serviço
+    # Conectar ao Google Sheets
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_dict = json.loads(gcp_key)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -228,7 +225,7 @@ def sync_google_sheets():
 
     all_data = ws.get_all_values()
     if len(all_data) <= 1:
-        print("Nenhum dado encontrado além dos cabeçalhos.")
+        print("Planilha sem registros para consulta.")
         return
 
     headers = all_data[0]
@@ -238,13 +235,13 @@ def sync_google_sheets():
     col_status_idx = 1 if len(headers) > 1 else -1
 
     awbs_to_track = []
-    row_mapping = {}  # Mapeia AWB -> Lista de números de linha (permite mesma AWB repetida se houver)
+    row_mapping = {}
 
     for row_num, row in enumerate(rows, start=2):
         awb = row[col_awb_idx].strip() if len(row) > col_awb_idx else ""
         current_status = row[col_status_idx].strip() if col_status_idx != -1 and len(row) > col_status_idx else ""
 
-        # Ignora linhas em branco e remessas que já foram finalizadas como ENTREGUE
+        # Apenas processa linhas preenchidas que ainda não foram marcadas como ENTREGUE
         if awb and current_status != "ENTREGUE":
             awbs_to_track.append(awb)
             row_mapping.setdefault(awb, []).append(row_num)
@@ -253,10 +250,10 @@ def sync_google_sheets():
     print(f"Total de remessas pendentes para atualização: {len(unique_awbs)}")
 
     if not unique_awbs:
-        print("Nenhuma remessa pendente de atualização. Finalizado.")
+        print("Nenhuma remessa pendente de atualização. Processo concluído.")
         return
 
-    # Consulta à API da FedEx em lotes
+    # Consulta à API FedEx
     client = FedExClient(client_id=client_id, client_secret=client_secret, sandbox=is_sandbox)
     parsed_results = {}
 
@@ -266,7 +263,7 @@ def sync_google_sheets():
             res = FedExParser.parse_tracking_result(item)
             parsed_results[res["AWB"]] = res
 
-    # Monta a matriz de atualização para gravação em lote no Google Sheets
+    # Gravação em lote na planilha
     now_str = time.strftime("%d/%m/%Y %H:%M")
     cells_to_update = []
 
@@ -280,7 +277,6 @@ def sync_google_sheets():
         })
 
         for r_num in rows_list:
-            # Colunas B (2) a G (7)
             cells_to_update.append(gspread.Cell(r_num, 2, data["Status"]))
             cells_to_update.append(gspread.Cell(r_num, 3, data["Aduana_Alerta"]))
             cells_to_update.append(gspread.Cell(r_num, 4, data["Local_Atual"]))
@@ -290,7 +286,7 @@ def sync_google_sheets():
 
     if cells_to_update:
         ws.update_cells(cells_to_update)
-        print(f"Planilha atualizada com sucesso! {len(cells_to_update)} células sincronizadas.")
+        print(f"Planilha sincronizada com sucesso! {len(cells_to_update)} células atualizadas.")
 
 
 if __name__ == "__main__":
