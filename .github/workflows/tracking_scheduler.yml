@@ -1,0 +1,37 @@
+name: FedEx Tracking Auto Sync
+
+on:
+  schedule:
+    # 07:00 BRT (10:00 UTC) e 12:00 BRT (15:00 UTC)
+    - cron: '0 10,15 * * 1-5'
+    # 15:30 BRT (18:30 UTC)
+    - cron: '30 18 * * 1-5'
+  workflow_dispatch: # Permite disparar manualmente pelo botão "Run workflow"
+
+jobs:
+  track-courier:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar Dependências
+        run: |
+          pip install requests gspread oauth2client
+
+      - name: Executar Rastreamento
+        env:
+          FEDEX_CLIENT_ID: ${{ secrets.FEDEX_CLIENT_ID }}
+          FEDEX_CLIENT_SECRET: ${{ secrets.FEDEX_CLIENT_SECRET }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          FEDEX_ENV: "production"
+        run: |
+          python fedex_tracker.py
