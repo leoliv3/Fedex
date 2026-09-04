@@ -2,11 +2,12 @@ name: FedEx Tracking Auto Sync
 
 on:
   schedule:
+    # Horários de Brasília (UTC-3):
     # 07:00 BRT (10:00 UTC) e 12:00 BRT (15:00 UTC)
     - cron: '0 10,15 * * 1-5'
     # 15:30 BRT (18:30 UTC)
     - cron: '30 18 * * 1-5'
-  workflow_dispatch: # Permite disparar manualmente pelo botão "Run workflow"
+  workflow_dispatch: # Botão para rodar manualmente
 
 jobs:
   track-courier:
@@ -20,10 +21,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Instalar Dependências
+      - name: Instalar Dependencias
         run: |
+          python -m pip install --upgrade pip
           pip install requests gspread oauth2client
 
       - name: Executar Rastreamento
