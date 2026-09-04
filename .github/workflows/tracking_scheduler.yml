@@ -30,6 +30,6 @@ jobs:
           FEDEX_CLIENT_SECRET: ${{ secrets.FEDEX_CLIENT_SECRET }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          FEDEX_ENV: "production"
+          FEDEX_ENV: "sandbox"
         run: |
           python fedex_tracker.py
