@@ -2,9 +2,11 @@ name: FedEx Tracking Auto Sync
 
 on:
   schedule:
+    # 07:00 BRT (10:00 UTC) e 12:00 BRT (15:00 UTC)
     - cron: '0 10,15 * * 1-5'
+    # 15:30 BRT (18:30 UTC)
     - cron: '30 18 * * 1-5'
-  workflow_dispatch:
+  workflow_dispatch: # Botão para executar manualmente
 
 jobs:
   track-courier:
@@ -30,6 +32,6 @@ jobs:
           FEDEX_CLIENT_SECRET: ${{ secrets.FEDEX_CLIENT_SECRET }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          FEDEX_ENV: "sandbox"
+          FEDEX_ENV: "production"
         run: |
           python fedex_tracker.py
