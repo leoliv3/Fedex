@@ -1,7 +1,6 @@
 import os
 import json
 import time
-from datetime import datetime, timedelta
 import requests
 from typing import List, Dict, Any, Optional
 import gspread
@@ -9,7 +8,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 
 class FedExClient:
-    """Gerencia autenticação OAuth 2.0 e requisições em lote à API REST da FedEx."""
+    """Cliente oficial da API REST da FedEx via OAuth 2.0 (Produção)."""
 
     def __init__(self, client_id: str, client_secret: str, sandbox: bool = False):
         self.client_id = client_id.strip() if client_id else ""
@@ -21,6 +20,7 @@ class FedExClient:
         self.token_expiry: float = 0
 
     def get_token(self) -> str:
+        """Gera ou renova o Bearer Token antes do vencimento."""
         if self.token and time.time() < (self.token_expiry - 60):
             return self.token
 
@@ -31,16 +31,17 @@ class FedExClient:
             "client_secret": self.client_secret
         }
 
-        response = requests.post(self.auth_url, data=payload, headers=headers, timeout=20)
-        if response.status_code != 200:
-            print(f"[ERRO AUTH FEDEX] {response.status_code} - {response.text}")
-        response.raise_for_status()
-        data = response.json()
+        res = requests.post(self.auth_url, data=payload, headers=headers, timeout=20)
+        if res.status_code != 200:
+            print(f"[ERRO FEDEX AUTH] Status: {res.status_code} | Resposta: {res.text}")
+        res.raise_for_status()
+        data = res.json()
         self.token = data["access_token"]
         self.token_expiry = time.time() + data.get("expires_in", 3600)
         return self.token
 
     def track_batch(self, tracking_numbers: List[str]) -> List[Dict[str, Any]]:
+        """Consulta até 30 AWBs por requisição na API de produção."""
         token = self.get_token()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -48,84 +49,57 @@ class FedExClient:
             "X-locale": "pt_BR"
         }
 
-        # Janela de data para forçar a busca no ciclo recente da FedEx
-        today = datetime.now()
-        date_begin = (today - timedelta(days=29)).strftime("%Y-%m-%d")
-        date_end = today.strftime("%Y-%m-%d")
-
-        tracking_info_list = []
-        for awb in tracking_numbers:
-            tracking_info_list.append({
-                "shipDateBegin": date_begin,
-                "shipDateEnd": date_end,
-                "trackingNumberInfo": {
-                    "trackingNumber": str(awb).strip(),
-                    "carrierCode": "FDXE"  # FDXE = FedEx Express International
-                }
-            })
+        tracking_info_list = [
+            {"trackingNumberInfo": {"trackingNumber": str(awb).strip()}}
+            for awb in tracking_numbers
+        ]
 
         payload = {
             "includeDetailedScans": True,
             "trackingInfo": tracking_info_list
         }
 
-        response = requests.post(self.track_url, json=payload, headers=headers, timeout=30)
-        
-        # Fallback: Se a janela estrita de 29 dias falhar, tenta consulta padrão ampla
-        if response.status_code != 200:
-            payload_fallback = {
-                "includeDetailedScans": True,
-                "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": str(awb).strip()}} for awb in tracking_numbers]
-            }
-            response = requests.post(self.track_url, json=payload_fallback, headers=headers, timeout=30)
-
-        response.raise_for_status()
-        res_json = response.json()
-        return res_json.get("output", {}).get("completeTrackResults", [])
+        res = requests.post(self.track_url, json=payload, headers=headers, timeout=30)
+        if res.status_code != 200:
+            print(f"[ERRO FEDEX TRACK] Status: {res.status_code} | Resposta: {res.text}")
+        res.raise_for_status()
+        return res.json().get("output", {}).get("completeTrackResults", [])
 
 
 class FedExParser:
+    """Extrai e padroniza os retornos priorizando o ciclo de 2026 e alertas aduaneiros."""
+
     CLEARANCE_KEYWORDS = [
         "clearance", "customs", "alfandega", "alfândega", "aduaneira",
-        "liberação", "liberacao", "fiscalização", "retido",
+        "liberação", "liberacao", "fiscalização", "fiscalizacao", "retido",
         "formal", "receita federal", "campinas", "viracopos", "vcp"
     ]
 
     @classmethod
-    def is_france_to_brazil_shipment(cls, track_obj: Dict[str, Any]) -> bool:
-        """Verifica se a remessa pertence à rota França -> Brasil descartando México."""
-        text = json.dumps(track_obj).upper()
-        # Se contiver referências explícitas a Brasil, Campinas, São Paulo ou França
-        if any(term in text for term in ["SAO PAULO", "CAMPINAS", "BRAZIL", " BR", "FRANCE", "ROISSY", "AUTRUY", "ARTENAY"]):
-            return True
-        return False
+    def score_track_result(cls, track_obj: Dict[str, Any]) -> float:
+        """Prioriza a rota França -> Brasil (2026) e penaliza registros legados."""
+        raw_text = json.dumps(track_obj).upper()
+        score = 0.0
 
-    @staticmethod
-    def _extract_latest_timestamp(track_obj: Dict[str, Any]) -> float:
-        dates = []
-        for s in track_obj.get("scanEvents", []):
-            if s.get("date"):
-                dates.append(str(s.get("date")))
-        for d in track_obj.get("dateAndTimes", []):
-            if d.get("dateTime"):
-                dates.append(str(d.get("dateTime")))
-        
-        if not dates:
-            return 0.0
-        
-        # Pega a maior string ISO (ex: "2026-09-04...")
-        latest_str = max(dates)[:19].replace("T", " ")
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                return time.mktime(time.strptime(latest_str[:len(fmt) + 2], fmt))
-            except Exception:
-                pass
-        return 0.0
+        for term in ["SAO PAULO", "CAMPINAS", "BRAZIL", " BR", "FRANCE", "ROISSY", "AUTRUY", "ARTENAY"]:
+            if term in raw_text:
+                score += 500.0
+
+        for mex_term in ["MERIDA", "TAPACHULA", "PINOTEPA", ", MX", "MEXICO"]:
+            if mex_term in raw_text:
+                score -= 1000.0
+
+        if "2026" in raw_text:
+            score += 200.0
+        elif "2023" in raw_text:
+            score -= 200.0
+
+        return score
 
     @classmethod
-    def parse_best_track(cls, awb: str, candidate_complete_results: List[Dict[str, Any]]) -> Dict[str, str]:
+    def parse_best_track(cls, awb: str, candidate_results: List[Dict[str, Any]]) -> Dict[str, str]:
         all_tracks = []
-        for comp in candidate_complete_results:
+        for comp in candidate_results:
             for t in comp.get("trackResults", []):
                 if "error" not in t:
                     all_tracks.append(t)
@@ -140,16 +114,9 @@ class FedExParser:
                 "Detalhe": "Sem dados retornados"
             }
 
-        # 1. Filtro Prioritário: Seleciona as remessas da rota França -> Brasil
-        fr_br_tracks = [t for t in all_tracks if cls.is_france_to_brazil_shipment(t)]
-        
-        # Se encontrou a rota FR->BR, descarta sumariamente os registros do México
-        pool_to_select = fr_br_tracks if fr_br_tracks else all_tracks
+        track_selected = max(all_tracks, key=cls.score_track_result)
 
-        # 2. Seleciona o pacote mais novo
-        track_selected = max(pool_to_select, key=cls._extract_latest_timestamp)
-
-        # Status Geral
+        # 1. Status Geral
         status_detail = track_selected.get("latestStatusDetail", {})
         code = status_detail.get("code", "")
         desc = status_detail.get("description", "Em Trânsito")
@@ -160,7 +127,7 @@ class FedExParser:
         elif code in ["DE", "CD"]:
             status_resumido = "RETIDO / EXCEÇÃO"
 
-        # Local Atual (ordena scanEvents cronologicamente de forma decrescente)
+        # 2. Localização Atual
         scan_events = track_selected.get("scanEvents", [])
         local_atual = "Não identificado"
         last_event_desc = ""
@@ -174,7 +141,6 @@ class FedExParser:
             parts = [loc.get("city"), loc.get("stateOrProvinceCode"), loc.get("countryCode")]
             local_atual = ", ".join([p for p in parts if p]) or "Não identificado"
 
-        # Se foi entregue, valida se temos o destino final em SP
         if code == "DL":
             dest_loc = track_selected.get("destinationLocation", {}).get("locationContactAndAddress", {}).get("address", {})
             dest_city = dest_loc.get("city")
@@ -182,7 +148,7 @@ class FedExParser:
             if dest_city:
                 local_atual = f"{dest_city}, {dest_state} BR".strip()
 
-        # 3. Alerta de Aduana / Liberação Formal (Campinas / VCP)
+        # 3. Alerta Aduaneiro (Viracopos / Campinas / Retenção)
         aduana_alerta = "NÃO"
         check_text = f"{desc} {code} {last_event_desc} {local_atual}".lower()
 
@@ -197,7 +163,7 @@ class FedExParser:
             else:
                 aduana_alerta = "⚠️ AGUARDANDO LIBERAÇÃO / ADUANA"
 
-        # 4. Previsão ou Data Real
+        # 4. Data de Entrega ou Previsão
         dates = track_selected.get("dateAndTimes", [])
         data_entrega = "N/A"
         actual_del = next((d.get("dateTime") for d in dates if d.get("type") == "ACTUAL_DELIVERY"), None)
@@ -208,10 +174,11 @@ class FedExParser:
         elif est_del:
             data_entrega = f"Prevista: {str(est_del)[:10]}"
 
-        # Detalhe descritivo
         detalhe_final = desc
         if last_event_desc and last_event_desc.lower() not in desc.lower():
             detalhe_final = f"{desc} - {last_event_desc}"
+
+        print(f"[SELECIONADO AWB {awb}]: Local={local_atual} | Status={status_resumido} | Alerta={aduana_alerta}")
 
         return {
             "AWB": awb,
@@ -238,6 +205,7 @@ def sync_google_sheets():
     if not gcp_key or not sheet_id:
         raise ValueError("Secrets GCP_SA_KEY ou GSHEET_ID não configurados.")
 
+    # Conectar ao Google Sheets
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_dict = json.loads(gcp_key)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -248,24 +216,33 @@ def sync_google_sheets():
 
     all_data = ws.get_all_values()
     if len(all_data) <= 1:
-        print("Planilha vazia.")
+        print("Planilha sem registros para consulta.")
         return
 
     headers = all_data[0]
     rows = all_data[1:]
 
     col_awb_idx = 0
+    col_status_idx = 1 if len(headers) > 1 else -1
+
     awbs_to_track = []
     row_mapping = {}
 
     for row_num, row in enumerate(rows, start=2):
         awb = str(row[col_awb_idx]).strip() if len(row) > col_awb_idx else ""
-        if awb:
+        current_status = str(row[col_status_idx]).strip() if col_status_idx != -1 and len(row) > col_status_idx else ""
+
+        # Ignora linhas vazias ou já entregues
+        if awb and current_status != "ENTREGUE":
             awbs_to_track.append(awb)
             row_mapping.setdefault(awb, []).append(row_num)
 
     unique_awbs = list(set(awbs_to_track))
-    print(f"AWBs a consultar: {unique_awbs}")
+    print(f"Total de remessas para processar: {len(unique_awbs)}")
+
+    if not unique_awbs:
+        print("Nenhuma remessa pendente de atualização. Finalizado.")
+        return
 
     client = FedExClient(client_id=client_id, client_secret=client_secret, sandbox=is_sandbox)
 
@@ -304,7 +281,7 @@ def sync_google_sheets():
 
     if cells_to_update:
         ws.update_cells(cells_to_update)
-        print(f"Planilha sincronizada com sucesso! {len(cells_to_update)} células gravadas.")
+        print(f"Sincronização concluída com sucesso! {len(cells_to_update)} células gravadas.")
 
 
 if __name__ == "__main__":
